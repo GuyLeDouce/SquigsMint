@@ -1,134 +1,151 @@
-import 'dotenv/config';
-import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
-import { ethers } from 'ethers';
+// index.js - Squigs Mint Bot (polling version)
 
-// -------- ENV --------
-const {
-  DISCORD_TOKEN,
-  DISCORD_CHANNEL_ID,
-  ALCHEMY_WS_URL,
-  CONTRACT_ADDRESS = '0x9bf567ddf41b425264626d1b8b2c7f7c660b1c42',
-} = process.env;
+const { Client, GatewayIntentBits, EmbedBuilder, Events } = require("discord.js");
+const { ethers } = require("ethers");
 
-if (!DISCORD_TOKEN || !DISCORD_CHANNEL_ID || !ALCHEMY_WS_URL) {
-  console.error('Missing env vars. Check DISCORD_TOKEN, DISCORD_CHANNEL_ID, ALCHEMY_WS_URL');
-  process.exit(1);
-}
+// ---------- Config ----------
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 
-// -------- Constants --------
-const ZERO = '0x0000000000000000000000000000000000000000';
-const IMAGE_BASE = 'https://assets.bueno.art/images/a49527dc-149c-4cbc-9038-d4b0d1dbf0b2/default';
-const OPENSEA_BASE = `https://opensea.io/item/ethereum/${CONTRACT_ADDRESS}`;
+// Use HTTP RPC for reliable polling
+const ALCHEMY_HTTP_URL = process.env.ALCHEMY_HTTP_URL;
 
-// ERC-721 minimal ABI for Transfer
-const ERC721_ABI = [
-  'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)'
+// Squigs contract
+const CONTRACT_ADDRESS = "0x9bf567ddf41b425264626d1b8b2c7f7c660b1c42";
+
+// Optional: set a start block manually via env if you want
+const START_BLOCK_ENV = process.env.START_BLOCK;
+
+// ABI just for Transfer event
+const ABI = [
+  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
 ];
 
-// Dedup cache (avoid dupes on reconnects)
-const seen = new Set();
+const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_HTTP_URL);
+const iface = new ethers.utils.Interface(ABI);
 
-// -------- Discord Client --------
+const TRANSFER_TOPIC = iface.getEventTopic("Transfer");
+const ZERO_ADDRESS = ethers.constants.AddressZero;
+
+let lastCheckedBlock;
+
+// ---------- Discord client ----------
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
-client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-});
+// Shorten address helper (you can switch to full if you want)
+function shortAddress(addr) {
+  return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+}
 
-// -------- Provider + Subscription with Reconnect --------
-let provider;
-let contract;
-let subscriptionActive = false;
-let backoffMs = 1000;
-
-async function connectProvider() {
+// Build and send the embed for a mint
+async function postMint(tokenId, minter) {
   try {
-    provider = new ethers.WebSocketProvider(ALCHEMY_WS_URL);
-    contract = new ethers.Contract(CONTRACT_ADDRESS, ERC721_ABI, provider);
-
-    provider._websocket?.on('close', (code) => {
-      console.warn(`WS closed: ${code}. Reconnecting...`);
-      resubscribeWithBackoff();
-    });
-    provider._websocket?.on('error', (err) => {
-      console.error('WS error:', err?.message ?? err);
-      resubscribeWithBackoff();
-    });
-
-    await subscribe();
-    backoffMs = 1000; // reset on success
-  } catch (err) {
-    console.error('Provider connect error:', err?.message ?? err);
-    resubscribeWithBackoff();
-  }
-}
-
-async function subscribe() {
-  if (subscriptionActive) return;
-  console.log('Subscribing to Transfer events...');
-  contract.on('Transfer', handleTransfer);
-  subscriptionActive = true;
-  console.log('Subscribed.');
-}
-
-function unsubscribe() {
-  if (!subscriptionActive) return;
-  contract.removeListener('Transfer', handleTransfer);
-  subscriptionActive = false;
-}
-
-function resubscribeWithBackoff() {
-  unsubscribe();
-  try { provider?.destroy?.(); } catch {}
-  provider = null;
-  setTimeout(connectProvider, backoffMs);
-  backoffMs = Math.min(backoffMs * 2, 60_000);
-}
-
-// -------- Event Handler --------
-async function handleTransfer(from, to, tokenIdBn, event) {
-  try {
-    if ((from?.toLowerCase?.() ?? '') !== ZERO) return; // Only mints
-    const tokenId = tokenIdBn.toString();
-
-    // Prevent duplicates on occasional WS replay
-    const key = `${event.log.blockHash}:${event.log.transactionHash}:${tokenId}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-
-    const minter = to;
-    const title = `Squig #${tokenId} has been minted by ${minter}`;
-    const imageUrl = `${IMAGE_BASE}/${tokenId}`;
-    const openseaUrl = `${OPENSEA_BASE}/${tokenId}`;
+    const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
 
     const embed = new EmbedBuilder()
-      .setTitle(title)
-      .setDescription(`[Check it out on OpenSea](${openseaUrl})`)
-      .setImage(imageUrl)
-      .setTimestamp(new Date())
-      .setFooter({ text: 'Squigs Mint Alert' });
+      .setTitle(`Squig #${tokenId} has been minted by ${minter}`)
+      .setDescription(
+        `[Check it out on OpenSea](https://opensea.io/assets/ethereum/${CONTRACT_ADDRESS}/${tokenId})`
+      )
+      .setImage(
+        `https://assets.bueno.art/images/a49527dc-149c-4cbc-9038-d4b0d1dbf0b2/default/${tokenId}`
+      )
+      .setTimestamp();
 
-    const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
     await channel.send({ embeds: [embed] });
 
     console.log(`Posted mint: tokenId=${tokenId} minter=${minter}`);
   } catch (err) {
-    console.error('handleTransfer error:', err?.message ?? err);
+    console.error("Error posting mint to Discord:", err);
   }
 }
 
-// -------- Start --------
-(async () => {
-  await client.login(DISCORD_TOKEN);
-  await connectProvider();
-})();
+// Poll for new mints
+async function pollForMints() {
+  try {
+    const latestBlock = await provider.getBlockNumber();
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('Shutting down...');
-  unsubscribe();
-  try { provider?.destroy?.(); } catch {}
-  process.exit(0);
+    // First run: set starting block
+    if (lastCheckedBlock === undefined) {
+      if (START_BLOCK_ENV) {
+        lastCheckedBlock = parseInt(START_BLOCK_ENV, 10);
+        console.log(`Using START_BLOCK from env: ${lastCheckedBlock}`);
+      } else {
+        lastCheckedBlock = latestBlock;
+        console.log(`Initial lastCheckedBlock set to current block: ${lastCheckedBlock}`);
+      }
+      return;
+    }
+
+    if (latestBlock <= lastCheckedBlock) {
+      // Nothing new to check yet
+      return;
+    }
+
+    const fromBlock = lastCheckedBlock + 1;
+    const toBlock = latestBlock;
+
+    console.log(`Checking logs from block ${fromBlock} to ${toBlock}...`);
+
+    const logs = await provider.getLogs({
+      address: CONTRACT_ADDRESS,
+      fromBlock,
+      toBlock,
+      topics: [
+        TRANSFER_TOPIC,
+        ethers.utils.hexZeroPad(ZERO_ADDRESS, 32) // from == 0x000... for mints
+      ]
+    });
+
+    if (logs.length > 0) {
+      console.log(`Found ${logs.length} mint log(s).`);
+    }
+
+    for (const log of logs) {
+      const parsed = iface.parseLog(log);
+      const { from, to, tokenId } = parsed.args;
+
+      // Extra safety check
+      if (from.toLowerCase() === ZERO_ADDRESS.toLowerCase()) {
+        await postMint(tokenId.toString(), to);
+      }
+    }
+
+    lastCheckedBlock = latestBlock;
+  } catch (err) {
+    console.error("Error in pollForMints:", err);
+  }
+}
+
+// Discord ready
+client.once(Events.ClientReady, (c) => {
+  console.log(`Logged in as ${c.user.tag}`);
+});
+
+// Optional test command: type !minttest in your channel to see a sample embed
+client.on("messageCreate", async (message) => {
+  if (!message.guild) return;
+  if (message.author.bot) return;
+
+  if (message.content.startsWith("!minttest")) {
+    await postMint("9999", "0x0000000000000000000000000000000000000000");
+    await message.reply("Posted a test mint embed.");
+  }
+});
+
+// Start everything
+async function start() {
+  console.log("Starting Squigs Mint Bot (polling mode)...");
+  await client.login(DISCORD_TOKEN);
+
+  // Start polling every 15 seconds
+  console.log("Starting mint polling loop (15s interval)...");
+  setInterval(pollForMints, 15000);
+}
+
+start().catch((err) => {
+  console.error("Fatal error in start():", err);
+  process.exit(1);
 });
