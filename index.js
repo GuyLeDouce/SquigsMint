@@ -1,45 +1,40 @@
-// index.js - Squigs Mint Bot (polling version)
-
+// index.js – Squigs Mint Bot (Polling Version)
 const { Client, GatewayIntentBits, EmbedBuilder, Events } = require("discord.js");
 const { ethers } = require("ethers");
 
-// ---------- Config ----------
+// ---------- CONFIG ----------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 
-// Use HTTP RPC for reliable polling
+// Alchemy HTTP RPC (IMPORTANT: must be the HTTP URL)
 const ALCHEMY_HTTP_URL = process.env.ALCHEMY_HTTP_URL;
 
-// Squigs contract
+// Squigs Contract
 const CONTRACT_ADDRESS = "0x9bf567ddf41b425264626d1b8b2c7f7c660b1c42";
 
-// Optional: set a start block manually via env if you want
+// Optional: force a manual start block
 const START_BLOCK_ENV = process.env.START_BLOCK;
 
-// ABI just for Transfer event
+// ABI for Transfer() event
 const ABI = [
   "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
 ];
 
+// Ethers v5 style provider (this works!)
 const provider = new ethers.providers.JsonRpcProvider(ALCHEMY_HTTP_URL);
 const iface = new ethers.utils.Interface(ABI);
 
 const TRANSFER_TOPIC = iface.getEventTopic("Transfer");
-const ZERO_ADDRESS = ethers.constants.AddressZero;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 let lastCheckedBlock;
 
-// ---------- Discord client ----------
+// ---------- DISCORD CLIENT ----------
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
-// Shorten address helper (you can switch to full if you want)
-function shortAddress(addr) {
-  return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
-}
-
-// Build and send the embed for a mint
+// ---------- HELPER: EMBED BUILDER ----------
 async function postMint(tokenId, minter) {
   try {
     const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
@@ -56,33 +51,29 @@ async function postMint(tokenId, minter) {
 
     await channel.send({ embeds: [embed] });
 
-    console.log(`Posted mint: tokenId=${tokenId} minter=${minter}`);
+    console.log(`Posted mint: tokenId=${tokenId}, minter=${minter}`);
   } catch (err) {
-    console.error("Error posting mint to Discord:", err);
+    console.error("Error posting mint embed:", err);
   }
 }
 
-// Poll for new mints
+// ---------- POLLING LOGIC ----------
 async function pollForMints() {
   try {
     const latestBlock = await provider.getBlockNumber();
 
-    // First run: set starting block
     if (lastCheckedBlock === undefined) {
       if (START_BLOCK_ENV) {
-        lastCheckedBlock = parseInt(START_BLOCK_ENV, 10);
+        lastCheckedBlock = parseInt(START_BLOCK_ENV);
         console.log(`Using START_BLOCK from env: ${lastCheckedBlock}`);
       } else {
         lastCheckedBlock = latestBlock;
-        console.log(`Initial lastCheckedBlock set to current block: ${lastCheckedBlock}`);
+        console.log(`Initial lastCheckedBlock set: ${lastCheckedBlock}`);
       }
       return;
     }
 
-    if (latestBlock <= lastCheckedBlock) {
-      // Nothing new to check yet
-      return;
-    }
+    if (latestBlock <= lastCheckedBlock) return;
 
     const fromBlock = lastCheckedBlock + 1;
     const toBlock = latestBlock;
@@ -95,20 +86,19 @@ async function pollForMints() {
       toBlock,
       topics: [
         TRANSFER_TOPIC,
-        ethers.utils.hexZeroPad(ZERO_ADDRESS, 32) // from == 0x000... for mints
+        ethers.utils.hexZeroPad(ZERO_ADDRESS, 32) // mints only
       ]
     });
 
     if (logs.length > 0) {
-      console.log(`Found ${logs.length} mint log(s).`);
+      console.log(`Found ${logs.length} new mint(s)!`);
     }
 
     for (const log of logs) {
       const parsed = iface.parseLog(log);
       const { from, to, tokenId } = parsed.args;
 
-      // Extra safety check
-      if (from.toLowerCase() === ZERO_ADDRESS.toLowerCase()) {
+      if (from.toLowerCase() === ZERO_ADDRESS) {
         await postMint(tokenId.toString(), to);
       }
     }
@@ -119,33 +109,32 @@ async function pollForMints() {
   }
 }
 
-// Discord ready
+// ---------- DISCORD READY ----------
 client.once(Events.ClientReady, (c) => {
   console.log(`Logged in as ${c.user.tag}`);
 });
 
-// Optional test command: type !minttest in your channel to see a sample embed
+// ---------- OPTIONAL TEST COMMAND ----------
 client.on("messageCreate", async (message) => {
   if (!message.guild) return;
   if (message.author.bot) return;
 
   if (message.content.startsWith("!minttest")) {
     await postMint("9999", "0x0000000000000000000000000000000000000000");
-    await message.reply("Posted a test mint embed.");
+    await message.reply("Test mint embed sent.");
   }
 });
 
-// Start everything
+// ---------- START ----------
 async function start() {
-  console.log("Starting Squigs Mint Bot (polling mode)...");
+  console.log("Starting Squigs Mint Bot...");
   await client.login(DISCORD_TOKEN);
 
-  // Start polling every 15 seconds
-  console.log("Starting mint polling loop (15s interval)...");
+  console.log("Starting polling loop (15s)...");
   setInterval(pollForMints, 15000);
 }
 
 start().catch((err) => {
-  console.error("Fatal error in start():", err);
+  console.error("Fatal error:", err);
   process.exit(1);
 });
